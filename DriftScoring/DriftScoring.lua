@@ -1,165 +1,234 @@
----@ext
-ConfigFile = ac.INIConfig.load(ac.getFolder(ac.FolderID.ACApps) .. "/lua/DriftScoring/" .. "settings.ini")
-DisplayScale = ConfigFile:get("settings", "displayscale", 1)
-BoardScale = ConfigFile:get("settings", "boardscale", 1)
-AngleScale = ConfigFile:get("settings", "anglescale", 1)
-ShowPraises = ConfigFile:get("settings", "showpraises", true)
-LapScoringEnabled = ConfigFile:get("settings", "lapscoring", true)
-ConfigFile:set("settings", "displayscale", DisplayScale)
-ConfigFile:set("settings", "boardscale", BoardScale)
-ConfigFile:set("settings", "anglescale", AngleScale)
-ConfigFile:set("settings", "showpraises", ShowPraises)
-ConfigFile:set("settings", "lapscoring", LapScoringEnabled)
-ConfigFile:save()
+local requiredSpeed = 35
 
-CurrentDriftTime = 0
-CurrentDriftTimeout = 2
-CurrentDriftScore = 0
-CurrentDriftCombo = 1
-TotalScore = 0
-TotalScoreTarget = 0
-BestDrift = 0
-BestDriftTarget = 0
-BestLapScore = 0
-BestLapScoreTarget = 0
-SecondsTimer = 0
-UpdatesTimer = 0
-LongDriftTimer = 0
-NoDriftTimer = 0
-SplineReached = 0
-CurrentLapScoreCut = false
-CurrentLapScoreCutValue = 0
-CurrentLapScore = 0
-CurrentLapScoreTarget = 0
-SubmittedLapDriftScore = 0
 
-ExtraScore = false
-ExtraScoreMultiplier = 1
-InitialScoreMultiplier = 0
-NearestCarDistance = 1
-
-local TrackHasSpline = ac.hasTrackSpline() and LapScoringEnabled
-ac.log("TrackHasSpline", TrackHasSpline)
-
-RecordsFile = ac.INIConfig.load(ac.getFolder(ac.FolderID.ACApps) .. "/lua/DriftScoring/" .. "data.ini")
-RecordDrift = 0
-RecordDriftTarget = RecordsFile:get(ac.getCarID(0) .. "_" .. ac.getTrackFullID("_"), "recorddrift", 0)
-RecordBestLap = 0
-RecordBestLapTarget = RecordsFile:get(ac.getCarID(0) .. "_" .. ac.getTrackFullID("_"), "recordlap", 0)
-
-ComboReached = 0
-
-NoWarning = true
-
-Sim = ac.getSim()
-Car = ac.getCar(0)
-
-local angle
-local dirt
-
-function getNearbyCarDistance()
-    PlayerCarPos = ac.getCar(Car.index).position
-    local lowestDist = 9999999
-    for i = 1,9999 do
-        if ac.getCar(i) and i ~= 0 then
-            local distance = math.distance(ac.getCar(0).position, ac.getCar(i).position)
-            if distance < lowestDist and (not ac.getCar(i).isInPit) and (not ac.getCar(i).isInPitlane) and ac.getCar(i).isConnected then
-                lowestDist = distance
-            end
-        elseif not ac.getCar(i) then
-            break
-        end
-    end
-    return lowestDist
+function script.prepare(dt)
+    ac.debug("speed", ac.getCarState(1).speedKmh)
+    return ac.getCarState(1).speedKmh > 60
 end
+
+local timePassed = 0
+local totalScore = 0
+local comboMeter = 1
+local comboColor = 0
+local highestScore =  0
+local dangerouslySlowTimer = 0
+local carsState = {}
+local wheelsWarningTimeout = 0
+local DriftTracking = ac.getCarState(1)
+local stored = { }
+
+stored.playerscore = ac.storage('playerscore', highestScore) --default value
+highestScore = stored.playerscore:get()
+ac.sendChatMessage("has a highscore of " .. highestScore .. " pts.")
+
+local function sendhighscore(connectedCarIndex, connectedSessionID)
+    ac.sendChatMessage("has a highscore of " .. highestScore .. " pts.")
+end
+
+ac.onClientConnected(sendhighscore)
 
 function script.update(dt)
-    Sim = ac.getSim()
-    Car = ac.getCar(0)
-    if not Sim.isPaused then
-        SecondsTimer = SecondsTimer + dt
-        UpdatesTimer = UpdatesTimer + 1
-        angle = math.max(0, ((math.max(math.abs(Car.wheels[2].slipAngle), math.abs(Car.wheels[3].slipAngle))))))
 
-        if (Car.localVelocity.z <= 0 and Car.speedKmh > 1) then
-            angle = 180 - angle
+    local player = ac.getCarState(1)
+    if player.engineLifeLeft < 1 then
+        if totalScore > highestScore then
+            highestScore = math.floor(totalScore)
+            stored.playerscore:set(highestScore)
+            ac.sendChatMessage("has a NEW highscore of " .. totalScore .. " pts.")
         end
-        dirt = math.min(math.abs(Car.wheels[0].surfaceDirt), math.abs(Car.wheels[1].surfaceDirt), math.abs(Car.wheels[2].surfaceDirt), math.abs(Car.wheels[3].surfaceDirt))
+        totalScore = 0
+        comboMeter = 1
+        return
+    end
 
-        if angle > 10 and Car.speedKmh > 20 and dirt == 0 and Car.wheelsOutside < 4 and ((not TrackHasSpline) or Car.splinePosition >= SplineReached - 0.0001) then
-            CurrentDriftTimeout = math.min(1, CurrentDriftTimeout + dt)
-            CurrentDriftScore = CurrentDriftScore + (((((angle - 10) * 10 + (Car.speedKmh - 20) * 10) * 0.5) * dt * CurrentDriftCombo)) * ExtraScoreMultiplier * InitialScoreMultiplier * 0.2
-            CurrentDriftCombo = math.min(5, CurrentDriftCombo + (((((angle - 10) + (Car.speedKmh - 20)) * 0.5) * dt) / 100) * ExtraScoreMultiplier * InitialScoreMultiplier * 0.5)
-            LongDriftTimer = LongDriftTimer + dt
-            NoDriftTimer = 0.5
-            InitialScoreMultiplier = math.min(1, LongDriftTimer)
-            if ComboReached < CurrentDriftCombo then
-                ComboReached = CurrentDriftCombo
-            end
-        elseif CurrentDriftCombo > 1 then
-            CurrentDriftTimeout = math.min(1, CurrentDriftTimeout + dt)
-            CurrentDriftCombo = math.max(1, CurrentDriftCombo - 0.1 * (NoDriftTimer ^ 2) * dt)
-            NoDriftTimer = NoDriftTimer + dt
-            LongDriftTimer = 0
-        elseif CurrentDriftCombo == 1 and CurrentDriftTimeout > 0 then
-            CurrentDriftTimeout = CurrentDriftTimeout - dt
-            NoDriftTimer = NoDriftTimer + dt
-            LongDriftTimer = 0
-        elseif CurrentDriftTimeout <= 0 then
-            CurrentDriftTimeout = 0
-            LongDriftTimer = 0
-            NoDriftTimer = NoDriftTimer + dt
-            if NoWarning then
-                if CurrentDriftScore > 0 then
-                    TotalScoreTarget = TotalScoreTarget + math.floor(CurrentDriftScore)
-                    if TrackHasSpline then
-                        SubmittedLapDriftScore = SubmittedLapDriftScore + math.max(0, math.floor(CurrentDriftScore))
-                    end
-                    if math.floor(CurrentDriftScore) > BestDriftTarget then
-                        BestDriftTarget = math.floor(CurrentDriftScore)
-                    end
+    timePassed = timePassed + dt
+
+    local comboFadingRate = 0.5 * math.lerp(1, 0.1, math.lerpInvSat(player.speedKmh, 80, 200)) + player.wheelsOutside
+    comboMeter = math.max(1, comboMeter - dt * comboFadingRate)
+
+    local sim = ac.getSimState()
+    while sim.carsCount > #carsState do
+        carsState[#carsState + 1] = {}
+    end
+
+    if wheelsWarningTimeout > 0 then
+        wheelsWarningTimeout = wheelsWarningTimeout - dt
+    elseif player.wheelsOutside > 0 then
+        addMessage("Car is outside", -1)
+        wheelsWarningTimeout = 60
+    end
+    if player.speedKmh < requiredSpeed then
+        if dangerouslySlowTimer > 3 then
+        if totalScore > highestScore then
+            highestScore = math.floor(totalScore)
+            stored.playerscore:set(highestScore)
+            ac.sendChatMessage("has a NEW highscore of " .. totalScore .. " pts.")
+        end
+            totalScore = 0
+            comboMeter = 1
+        else
+        end
+
+        dangerouslySlowTimer = dangerouslySlowTimer + dt
+        comboMeter = 1
+        return
+    else
+        dangerouslySlowTimer = 0
+    end
+
+    for i = 1, ac.getSimState().carsCount do
+        local car = ac.getCarState(i)
+        local state = carsState[i]
+
+        if car.pos:closerToThan(player.pos, 10) then
+            local drivingAlong = math.dot(car.look, player.look) > 0.2
+            if not drivingAlong then
+                state.drivingAlong = false
+
+                if not state.nearMiss and car.pos:closerToThan(player.pos, 3) then
+                    state.nearMiss = true
+                    comboMeter = comboMeter + 1
                 end
             end
-            CurrentDriftScore = 0
-            CurrentDriftCombo = 1
-            ComboReached = 0
+
+            if car.collidedWith == 0 then
+                state.collided = true
+
+        		if totalScore > highestScore then
+            		highestScore = math.floor(totalScore)
+            		stored.playerscore:set(highestScore)
+            ac.sendChatMessage("has a NEW highscore of " .. totalScore .. " pts.")
+        		end
+                totalScore = 0
+                comboMeter = 1
+            end
+
+            if DriftTracking.isDriftValid then
+                totalScore = totalScore + math.ceil(1 * comboMeter)
+                comboMeter = comboMeter + 0.02
+                comboColor = comboColor + 5
+            end
+
+            if not state.overtaken and not state.collided and state.drivingAlong then
+                local posDir = (car.pos - player.pos):normalize()
+                local posDot = math.dot(posDir, car.look)
+                state.maxPosDot = math.max(state.maxPosDot, posDot)
+                if posDot < -0.5 and state.maxPosDot > 0.5 then
+                    totalScore = totalScore + math.ceil(10 * comboMeter)
+                    comboMeter = comboMeter + 1
+                    comboColor = comboColor + 10
+                    state.overtaken = true
+                end
+            end
+        else
+            state.maxPosDot = -1
+            state.overtaken = false
+            state.collided = false
+            state.drivingAlong = true
+            state.nearMiss = false
         end
-        -- Continue with the rest of the code...
     end
 end
 
-function script.windowDisplay()
-    ui.beginOutline()
-    ui.pushDWriteFont('OPTIEdgarBold:\\Fonts;Weight=Medium')
 
-    local baseColor = rgbm(1, 1, 1, 1)  -- White color for text
-    local highlightColor = rgbm(0, 1, 0, 1)  -- Green color for good results
-    local errorColor = rgbm(1, 0, 0, 1)  -- Red for warnings
+local messages = {}
 
-    -- Displaying the drift combo
-    if CurrentDriftCombo > 1 then
-        ui.dwriteText("Combo: x" .. math.ceil(CurrentDriftCombo * 10) / 10, 30 * DisplayScale, highlightColor)
-    else
-        ui.dwriteText("Combo: x" .. math.ceil(CurrentDriftCombo * 10) / 10, 30 * DisplayScale, baseColor)
+function addMessage(text, mood)
+    for i = math.min(#messages + 1, 4), 2, -1 do
+        messages[i] = messages[i - 1]
+        messages[i].targetPos = i
     end
-
-    -- Displaying drift score
-    if CurrentDriftScore > 5000 then
-        ui.dwriteText("Drift Score: " .. math.floor(CurrentDriftScore), 40 * DisplayScale, highlightColor)
-    else
-        ui.dwriteText("Drift Score: " .. math.floor(CurrentDriftScore), 40 * DisplayScale, baseColor)
+    messages[1] = {text = text, age = 0, targetPos = 1, currentPos = 1, mood = mood}
+    if mood == 1 then
+        for i = 1, 60 do
+            local dir = vec2(math.random() - 0.5, math.random() - 0.5)
+        end
     end
-
-    -- Displaying speed warnings
-    if Car.speedKmh <= 20 then
-        ui.dwriteText("TOO SLOW!", 20 * DisplayScale, errorColor)
-    end
-
-    -- Displaying off-track warnings
-    if dirt > 0 or Car.wheelsOutside == 4 then
-        ui.dwriteText("OFF-TRACK!", 20 * DisplayScale, errorColor)
-    end
-
-    ui.endOutline(0, 1.5)
-    ui.popDWriteFont()
 end
+
+local function updateMessages(dt)
+    comboColor = comboColor + dt * 10 * comboMeter
+    if comboColor > 360 then
+        comboColor = comboColor - 360
+    end
+    for i = 1, #messages do
+        local m = messages[i]
+        m.age = m.age + dt
+        m.currentPos = math.applyLag(m.currentPos, m.targetPos, 0.8, dt)
+    end
+    if comboMeter > 10 and math.random() > 0.98 then
+        for i = 1, math.floor(comboMeter) do
+            local dir = vec2(math.random() - 0.5, math.random() - 0.5)
+        end
+    end
+end
+local speedWarning = 0
+    function script.drawUI()
+        local uiState = ac.getUiState()
+        updateMessages(uiState.dt)
+
+        local speedRelative = math.saturate(math.floor(ac.getCarState(1).speedKmh) / requiredSpeed)
+        speedWarning = math.applyLag(speedWarning, speedRelative < 1 and 1 or 0, 0.5, uiState.dt)
+
+        local colorDark = rgbm(0.4, 0.4, 0.4, 1)
+        local colorGrey = rgbm(0.7, 0.7, 0.7, 1)
+        local colorAccent = rgbm.new(hsv(speedRelative * 120, 1, 1):rgb(), 1)
+        local colorCombo =
+            rgbm.new(hsv(comboColor, math.saturate(comboMeter / 10), 1):rgb(), math.saturate(comboMeter / 4))
+        local function speedMeter(ref)
+            ui.drawRectFilled(ref + vec2(0, -4), ref + vec2(180, 5), colorDark, 1)
+            ui.drawLine(ref + vec2(0, -4), ref + vec2(0, 4), colorGrey, 1)
+            ui.drawLine(ref + vec2(requiredSpeed, -4), ref + vec2(requiredSpeed, 4), colorGrey, 1)
+
+            local speed = math.min(ac.getCarState(1).speedKmh, 180)
+            if speed > 1 then
+                ui.drawLine(ref + vec2(0, 0), ref + vec2(speed, 0), colorAccent, 4)
+            end
+        end
+        ui.beginTransparentWindow("overtakeScore", vec2(100, 100), vec2(400 * 0.5, 400 * 0.5))
+        ui.beginOutline()
+
+        ui.pushStyleVar(ui.StyleVar.Alpha, 1 - speedWarning)
+        ui.pushFont(ui.Font.Main)
+        ui.textColored("Racing Server", colorCombo)
+        ui.textColored("Highest Score: " .. highestScore .. " pts", colorCombo)
+        ui.popFont()
+        ui.pushFont(ui.Font.Title)
+        ui.textColored(totalScore .. " pts", colorCombo)
+        ui.sameLine(0, 20)
+        ui.beginRotation()
+        ui.textColored(math.ceil(comboMeter * 10) / 10 .. "x", colorCombo)
+        if comboMeter > 20 then
+            ui.endRotation(math.sin(comboMeter / 180 * 3141.5) * 3 * math.lerpInvSat(comboMeter, 20, 30) + 90)
+        end
+        ui.popFont()
+        ui.popStyleVar()
+
+        ui.endOutline(rgbm(0, 0, 0, 0.3))
+
+        ui.offsetCursorY(20)
+        ui.pushFont(ui.Font.Main)
+        local startPos = ui.getCursor()
+        for i = 1, #messages do
+            local m = messages[i]
+            local f = math.saturate(4 - m.currentPos) * math.saturate(8 - m.age)
+            ui.setCursor(startPos + vec2(20 * 0.5 + math.saturate(1 - m.age * 10) ^ 2 * 50, (m.currentPos - 1) * 15))
+            ui.textColored(
+                m.text,
+                m.mood == 1 and rgbm(0, 1, 0, f) or m.mood == -1 and rgbm(1, 0, 0, f) or rgbm(1, 1, 1, f)
+            )
+        end
+        ui.popFont()
+        ui.setCursor(startPos + vec2(0, 4 * 30))
+
+        ui.pushStyleVar(ui.StyleVar.Alpha, speedWarning)
+        ui.setCursorY(0)
+        ui.pushFont(ui.Font.Main)
+        ui.textColored("Keep speed above " .. requiredSpeed .. " km/h:", colorAccent)
+        speedMeter(ui.getCursor() + vec2(-9 * 0.5, 4 * 0.2))
+
+        ui.popFont()
+        ui.popStyleVar()
+
+        ui.endTransparentWindow()
+    end
